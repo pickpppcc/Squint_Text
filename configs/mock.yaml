@@ -1,0 +1,103 @@
+# =============================================================================
+# ZenML Pipeline 配置 — Mock 端到端验证 (无 GPU, 秒级完成)
+#
+# 用法:
+#   ~/venvs/zenml/bin/python pipelines/run.py --config pipelines/configs/mock.yaml
+#
+# 产物规则: 每个 run 写入 <output_dir>/<run_id>/, 只新增, 不触碰已有数据。
+# 输入声明集中在 inputs: 段 (与 real 配置同构); mock 模式下多数输入不实际读取,
+# 仅作配置结构验证与血缘记录。
+# =============================================================================
+
+run:
+  mock: true
+  seed: 42
+
+# ======================= 输入声明 (与 real_*.yaml 同构) =======================
+inputs:
+  base_model:
+    hf_id: Qwen/Qwen3.5-9B
+    local_dir: /dockerdata/models/Qwen3.5-9B
+    cfs_src: /cfs/cfs-izx10hg3/cinniepeng/models/Qwen3.5-9B
+
+  diffusion:
+    base: SG161222/Realistic_Vision_V5.1_noVAE
+    controlnet: monster-labs/control_v1p_sd15_qrcode_monster
+    vae: stabilityai/sd-vae-ft-mse
+
+  pattern_text_pool: synthesis/inputs/patterns
+  pattern_fonts: synthesis/inputs/fonts
+  patterns_dir: synthesis/inputs/patterns/patterns
+
+  prompt_pool: synthesis/inputs/prompts/out_domain_carrier_prompts.jsonl
+
+  open_data:
+    sources:
+      - path: data/raw/all.jsonl          # 隐藏文字/AIGC 注册表 (registry 格式)
+        format: registry
+        weight: 4.0
+      - path: /cfs/cfs-18a3pglt/xinghaozhao/data4_clear/intern_139549_train_data4_detection.json
+        format: sharegpt                   # DocVQA/POIE/FUNSD/TextCaps 检测集
+        weight: 0.5
+      - path: data/sft/v3/ocr_vqa/train_5k_chat.jsonl
+        format: chat                       # OCR-VQA 多轮问答
+        weight: 0.25
+
+  eval_gt:
+    - data/gt/level23_all.jsonl
+    - data/gt/level23_hidden.jsonl
+
+# ---------- Step 0: 模型准备 (由 inputs 展开; mock 下只记录不下载) ----------
+models:
+  models: []
+
+# ---------- Step 0.5: pattern 准备 (mock 下生成占位图) ----------
+patterns:
+  generate_n: 4
+  seed: 42
+  output_dir: zenml_runs/patterns
+  python: /opt/conda/envs/torch-base/bin/python
+
+# ---------- Step 1: 数据合成 (mock: 占位图; real: 与历史 method1_2_cn2.0 一致) ----------
+synthesis:
+  output_dir: zenml_runs/synthesis
+  n: 4                       # mock: 占位图数量; real: 生成图数量
+  seed: 42
+  cn_scale: 2.0              # 历史配置 (cn2.0)
+  python: ~/venvs/zenml/bin/python   # 装有 torch+diffusers 的环境 (合成专用)
+  device: cuda:0
+
+# ---------- Step 2: 数据处理 (mock: 假 jsonl; real: 合成+开源 -> v4 parquet/sft jsonl) ----------
+processing:
+  output_dir: zenml_runs/processing
+  mode: from_synthesis
+  python: /opt/conda/envs/torch-base/bin/python
+  val_ratio: 0.05
+  seed: 42
+
+# ---------- Step 3: 模型训练 (mock: 假 checkpoint; real 参数见 real_*.yaml) ----------
+training:
+  mode: sft                  # opsd | sft (mock 模式下仅作记录)
+  script: pipelines/vendor/run_sft_v4.sh
+  mock_output_dir: zenml_runs
+  env:
+    MODE: ds8
+    GPUS: "0,1,2,3"
+    NPROC: "4"
+    BS: "2"
+    ACCUM: "8"
+  checkpoint_dir_fmt: /cfs/cfs-izx10hg3/cinniepeng/models
+
+# ---------- Step 4: 模型评估 (mock: 假 summary; real 见 real_*.yaml) ----------
+evaluation:
+  script: inference/experiments/run_benchmarks_hf.sh
+  benchmarks: ours           # 逗号分隔: ai2d,docvqa,ocrbench,ours
+  gpus: "0,1,2,3"
+  batch_size: 4
+  out_root: zenml_runs/predictions   # mock 假 summary 写这里, 不污染 data/predictions
+  # real 模式建议先 dry_run: true 验证链路, 确认后再删掉该行跑全量
+  # dry_run: true
+
+# ---------- 元数据汇总 ----------
+outputs:
+  metadata: zenml_runs

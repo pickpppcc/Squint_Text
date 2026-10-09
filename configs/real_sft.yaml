@@ -1,0 +1,123 @@
+# =============================================================================
+# ZenML Pipeline 配置 — 真实 SFT 训练 (GPU, LoRA + ms-swift, 保留原训练机制)
+#
+# 用法:
+#   ~/venvs/zenml/bin/python pipelines/run.py --config pipelines/configs/real_sft.yaml
+#
+# 输入声明集中在 inputs: 段 —— 换模型/换数据只改这一段;
+# 各 Step 段只剩运行参数 (数量/seed/GPU/环境等)。
+# 优先级: --set > step 段显式值 > inputs 段
+# =============================================================================
+
+run:
+  mock: false
+  seed: 42
+
+# ======================= 输入声明 (一次实验的全部外部输入) =======================
+inputs:
+  # --- 基座模型 (训练 + 评估共用) ---
+  # 换模型: 改这三行即可, prepare_models 会自动检查/下载
+  base_model:
+    hf_id: Qwen/Qwen3.5-9B                     # HF repo id (下载兜底)
+    local_dir: /dockerdata/models/Qwen3.5-9B   # 本地落地位置 (训练/评估读这里)
+    cfs_src: /cfs/cfs-izx10hg3/cinniepeng/models/Qwen3.5-9B   # CFS 备份 (优先拷贝)
+
+  # --- 扩散模型三件套 (pattern -> 隐藏文字图的合成器) ---
+  # 可换成其他 SD1.5 底模/ControlNet; 留空则用原脚本默认 (即下面这三个)
+  diffusion:
+    base: SG161222/Realistic_Vision_V5.1_noVAE            # SD1.5 底模
+    controlnet: monster-labs/control_v1p_sd15_qrcode_monster  # QR ControlNet
+    vae: stabilityai/sd-vae-ft-mse                        # VAE
+
+  # --- pattern 合成输入 (隐藏文字底图 = 合成数据的 control 图) ---
+  pattern_text_pool: synthesis/inputs/patterns      # 文字池: txt_from_segments/ + txt_from_api/
+  pattern_fonts: synthesis/inputs/fonts             # CJK 字体 (NotoSansSC Bold/Black)
+  patterns_dir: synthesis/inputs/patterns/patterns  # 已有 pattern (够则复用, 不足才生成)
+
+  # --- 载体场景 prompt 池 (合成时画面描述, 每行一条 jsonl/txt) ---
+  prompt_pool: synthesis/inputs/prompts/out_domain_carrier_prompts.jsonl
+
+  # --- 开源数据 (Step2 按 ratio 混入训练集, 与合成图同一 v4 格式) ---
+  # registry 格式 (jsonl 每行):
+  #   {"image_path": "/abs/x.jpg", "level1": "1", "ocr_gt": "文字A\n文字B",
+  #    "level3": "0", "source_split": "na"}
+  #   ocr_gt 多区域 \n 分隔, 空串=无文字图; benchmark GT 图片自动剔除 (防泄漏)
+  open_data:
+    sources:
+      - path: data/raw/all.jsonl          # 隐藏文字/AIGC 注册表 (registry 格式)
+        format: registry
+        weight: 4.0
+      - path: /cfs/cfs-18a3pglt/xinghaozhao/data4_clear/intern_139549_train_data4_detection.json
+        format: sharegpt                   # DocVQA/POIE/FUNSD/TextCaps 检测集
+        weight: 0.5
+      - path: data/sft/v3/ocr_vqa/train_5k_chat.jsonl
+        format: chat                       # OCR-VQA 多轮问答
+        weight: 0.25            # 开源:合成 ≈ 4:1 (对齐历史 v3)
+
+  # --- 评估 GT (血缘记录; benchmark 脚本内部读 data/gt/ 同路径) ---
+  eval_gt:
+    - data/gt/level23_all.jsonl
+    - data/gt/level23_hidden.jsonl
+
+# ---------- Step 0: 模型准备 (inputs.base_model + inputs.diffusion 自动展开) ----------
+models:
+  models: []   # 由 inputs 展开填充; 要加额外模型直接往这里加条目
+
+# ---------- Step 0.5: pattern 准备 ----------
+patterns:
+  # pattern_dir / text_pool_dir / font_dir 由 inputs 展开
+  generate_n: 100              # 已有 pattern 不足时生成的张数
+  seed: 42
+  output_dir: zenml_runs/patterns   # 生成产物输出根 (不覆盖已有 pattern 目录)
+  python: /opt/conda/envs/torch-base/bin/python   # 需 PIL/numpy/scipy
+
+# ---------- Step 1: 数据合成 (method1, 与历史 method1_2_cn2.0 配置一致) ----------
+# 生成器: pipelines/vendor/run_method1.py (模型可替换) ->
+#         synthesis/augmentation/generate_method1_method2.py --methods method1
+synthesis:
+  output_dir: zenml_runs/synthesis
+  n: 100
+  seed: 42
+  cn_scale: 2.0                    # 历史配置 (目录名 cn2.0 即指此)
+  # pattern / prompt_file / diffusion_* 由 inputs 展开
+  python: /root/venvs/zenml/bin/python
+  device: cuda:0
+
+# ---------- Step 2: 数据处理 (合成产物 + 开源数据 -> 训练集) ----------
+# from_synthesis (默认): pipelines/vendor/build_opsd_parquet_from_synthesis.py
+#   合成 manifest + inputs.open_data -> v4 parquet + sft jsonl, 不依赖历史中间产物
+# convert_existing: pipelines/vendor/convert_mixed_no_bbox_v4.py (v3->v4 复现历史)
+processing:
+  output_dir: zenml_runs/processing
+  mode: from_synthesis
+  python: /opt/conda/envs/torch-base/bin/python   # 需 pandas/PIL/pyarrow
+  val_ratio: 0.05
+  seed: 42
+  # open_data / open_ratio 由 inputs.open_data 展开
+
+# ---------- Step 3: SFT 训练 (vendored run_sft_v4.sh) ----------
+training:
+  mode: sft
+  script: pipelines/vendor/run_sft_v4.sh   # TRAIN_DATA/VAL_DATA/MODEL 支持 env 覆盖
+  use_pipeline_data: true                  # 用 Step 2 产出的 sft jsonl (ds8 双图格式)
+  env:
+    MODE: ds8                # orig | ds8
+    GPUS: "0,1,2,3"
+    NPROC: "4"
+    BS: "2"
+    ACCUM: "8"
+    # MODEL 由 inputs.base_model.local_dir 自动注入
+  checkpoint_dir_fmt: /cfs/cfs-izx10hg3/cinniepeng/models
+
+# ---------- Step 4: 评估 (bash inference/experiments/run_benchmarks_hf.sh) ----------
+evaluation:
+  script: inference/experiments/run_benchmarks_hf.sh
+  # model 由 inputs.base_model.local_dir 自动注入
+  benchmarks: ours           # ai2d,docvqa,ocrbench,ours
+  gpus: "0,1,2,3"
+  batch_size: 4
+  out_root: data/predictions/hf
+  dry_run: true              # 先低成本验证评估链路; 确认后删掉此行走全量
+
+outputs:
+  metadata: zenml_runs

@@ -1,0 +1,108 @@
+# =============================================================================
+# ZenML Pipeline 配置 — 真实 OPSD 蒸馏训练 (GPU, verl + vllm + FSDP)
+#
+# 用法:
+#   ~/venvs/zenml/bin/python pipelines/run.py --config pipelines/configs/real_opsd.yaml
+#
+# 输入声明集中在 inputs: 段 —— 换模型/换数据只改这一段。
+# 注意:
+#   - 训练机须有 conda env vision-opd (脚本内部自行激活)
+#   - v4b.sh 的 EXPERIMENT_NAME 与 MODEL_PATH 写死; 换基座模型时通过
+#     extra_args 覆盖 hydra: actor_rollout_ref.model.path=<新路径> 等
+#   - 脚本预检要求历史 v3 parquet 存在 (本机有; 全新机器需放开该检查)
+# =============================================================================
+
+run:
+  mock: false
+  seed: 42
+
+# ======================= 输入声明 (一次实验的全部外部输入) =======================
+inputs:
+  base_model:
+    hf_id: Qwen/Qwen3.5-9B
+    local_dir: /dockerdata/models/Qwen3.5-9B
+    cfs_src: /cfs/cfs-izx10hg3/cinniepeng/models/Qwen3.5-9B
+
+  diffusion:
+    base: SG161222/Realistic_Vision_V5.1_noVAE
+    controlnet: monster-labs/control_v1p_sd15_qrcode_monster
+    vae: stabilityai/sd-vae-ft-mse
+
+  pattern_text_pool: synthesis/inputs/patterns
+  pattern_fonts: synthesis/inputs/fonts
+  patterns_dir: synthesis/inputs/patterns/patterns
+
+  prompt_pool: synthesis/inputs/prompts/out_domain_carrier_prompts.jsonl
+
+  open_data:
+    sources:
+      - path: data/raw/all.jsonl          # 隐藏文字/AIGC 注册表 (registry 格式)
+        format: registry
+        weight: 4.0
+      - path: /cfs/cfs-18a3pglt/xinghaozhao/data4_clear/intern_139549_train_data4_detection.json
+        format: sharegpt                   # DocVQA/POIE/FUNSD/TextCaps 检测集
+        weight: 0.5
+      - path: data/sft/v3/ocr_vqa/train_5k_chat.jsonl
+        format: chat                       # OCR-VQA 多轮问答
+        weight: 0.25
+
+  eval_gt:
+    - data/gt/level23_all.jsonl
+    - data/gt/level23_hidden.jsonl
+
+# ---------- Step 0: 模型准备 (由 inputs 展开) ----------
+models:
+  models: []
+
+# ---------- Step 0.5: pattern 准备 ----------
+patterns:
+  generate_n: 100
+  seed: 42
+  output_dir: zenml_runs/patterns
+  python: /opt/conda/envs/torch-base/bin/python
+
+# ---------- Step 1: 数据合成 (method1, cn2.0 配置) ----------
+synthesis:
+  output_dir: zenml_runs/synthesis
+  n: 100
+  seed: 42
+  cn_scale: 2.0
+  python: /root/venvs/zenml/bin/python
+  device: cuda:0
+
+# ---------- Step 2: 数据处理 (合成 + 开源 -> v4 parquet) ----------
+processing:
+  output_dir: zenml_runs/processing
+  mode: from_synthesis
+  python: /opt/conda/envs/torch-base/bin/python
+  val_ratio: 0.05
+  seed: 42
+
+# ---------- Step 3: OPSD 训练 (bash other/Vision-OPD/scripts/run_opsd_..._v4b.sh) ----------
+training:
+  mode: opsd
+  script: other/Vision-OPD/scripts/run_opsd_gt_mixed_no_bbox_v4b.sh
+  checkpoint_dir: other/Vision-OPD/checkpoints/OPSD-Qwen3.5-9B-6k-opsd-gt-mixed-no-bbox-v4b
+  use_pipeline_data: true     # 用 Step 2 产出的 v4 parquet 训练 (覆盖 data.train_files)
+  extra_args:
+    - trainer.total_epochs=1        # 先小规模验证; 全量训练时删除此行
+    - trainer.n_gpus_per_node=1     # 小规模验证用 1 卡; 全量按机器改回
+  env: {}
+
+# ---------- Step 4: 评估 ----------
+# OPSD checkpoint 是 FSDP actor 目录, 不是 swift LoRA adapter;
+# 评估前先转权重或用 --set evaluation.skip_adapter=true 只评基座
+evaluation:
+  script: inference/experiments/run_benchmarks_hf.sh
+  # model 由 inputs.base_model.local_dir 自动注入
+  benchmarks: ours
+  gpus: "0,1,2,3"
+  batch_size: 4
+  out_root: data/predictions/hf
+  skip_adapter: false
+  dry_run: true
+  # env:
+  #   PY: /root/venvs/zenml/bin/python   # qwen3vl 不存在时的替代环境
+
+outputs:
+  metadata: zenml_runs
